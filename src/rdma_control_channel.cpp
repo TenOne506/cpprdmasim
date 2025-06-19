@@ -1,4 +1,6 @@
 #include "../include/rdma_control_channel.h"
+#include <iostream>
+#include <thread>
 
 RdmaControlChannel::RdmaControlChannel()
     : socket_fd_(-1), server_socket_fd_(-1), client_socket_fd_(-1),
@@ -9,17 +11,32 @@ RdmaControlChannel::~RdmaControlChannel() { close_connection(); }
 bool RdmaControlChannel::start_server(uint16_t port) {
   std::lock_guard<std::mutex> lock(mutex_);
 
+  std::cout << "Starting control channel server on port " << port << std::endl;
+
   if (state_ != ConnectionState::DISCONNECTED) {
+    error_msg_ = "Cannot start server: Invalid state " +
+                 std::to_string(static_cast<int>(state_));
+    std::cerr << error_msg_ << std::endl;
     return false;
+  }
+
+  // 检查是否有旧的socket需要关闭
+  if (server_socket_fd_ >= 0) {
+    std::cout << "Closing existing server socket: " << server_socket_fd_
+              << std::endl;
+    close(server_socket_fd_);
+    server_socket_fd_ = -1;
   }
 
   // 创建服务器socket
   server_socket_fd_ = socket(AF_INET, SOCK_STREAM, 0);
   if (server_socket_fd_ < 0) {
     error_msg_ = "Failed to create socket: " + std::string(strerror(errno));
+    std::cerr << error_msg_ << std::endl;
     state_ = ConnectionState::ERROR;
     return false;
   }
+  std::cout << "Created server socket: " << server_socket_fd_ << std::endl;
 
   // 设置socket选项，允许地址重用
   int opt = 1;
@@ -27,11 +44,13 @@ bool RdmaControlChannel::start_server(uint16_t port) {
                  sizeof(opt)) < 0) {
     error_msg_ =
         "Failed to set socket options: " + std::string(strerror(errno));
+    std::cerr << error_msg_ << std::endl;
     close(server_socket_fd_);
     server_socket_fd_ = -1;
     state_ = ConnectionState::ERROR;
     return false;
   }
+  std::cout << "Set SO_REUSEADDR option" << std::endl;
 
   // 绑定地址和端口
   struct sockaddr_in server_addr;
@@ -40,29 +59,39 @@ bool RdmaControlChannel::start_server(uint16_t port) {
   server_addr.sin_addr.s_addr = INADDR_ANY;
   server_addr.sin_port = htons(port);
 
+  std::cout << "Binding to port " << port << " (INADDR_ANY)..." << std::endl;
   if (bind(server_socket_fd_, (struct sockaddr *)&server_addr,
            sizeof(server_addr)) < 0) {
     error_msg_ = "Failed to bind socket: " + std::string(strerror(errno));
+    std::cerr << error_msg_ << std::endl;
+
+    // 检查端口是否已被占用
+    if (errno == EADDRINUSE) {
+      std::cerr << "Port " << port << " is already in use. Try another port."
+                << std::endl;
+    }
+
     close(server_socket_fd_);
     server_socket_fd_ = -1;
     state_ = ConnectionState::ERROR;
     return false;
   }
+  std::cout << "Successfully bound to port " << port << std::endl;
 
   // 开始监听连接
+  std::cout << "Starting to listen for connections..." << std::endl;
   if (listen(server_socket_fd_, 5) < 0) {
     error_msg_ = "Failed to listen on socket: " + std::string(strerror(errno));
+    std::cerr << error_msg_ << std::endl;
     close(server_socket_fd_);
     server_socket_fd_ = -1;
     state_ = ConnectionState::ERROR;
     return false;
   }
 
-  // 设置为非阻塞模式
-  int flags = fcntl(server_socket_fd_, F_GETFL, 0);
-  fcntl(server_socket_fd_, F_SETFL, flags | O_NONBLOCK);
-
+  // 保持阻塞模式以确保可靠连接
   state_ = ConnectionState::CONNECTING;
+  std::cout << "Server successfully started on port " << port << std::endl;
   return true;
 }
 
@@ -70,43 +99,81 @@ bool RdmaControlChannel::accept_connection(uint32_t timeout_ms) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   if (state_ != ConnectionState::CONNECTING || server_socket_fd_ < 0) {
+    std::cerr << "Invalid state for accepting connection. State: "
+              << static_cast<int>(state_) << ", Socket: " << server_socket_fd_
+              << std::endl;
     return false;
   }
 
-  struct pollfd pfd;
-  pfd.fd = server_socket_fd_;
-  pfd.events = POLLIN;
+  std::cout << "Waiting for client connection..." << std::endl;
 
-  int poll_result = poll(&pfd, 1, timeout_ms);
-  if (poll_result <= 0) {
-    // 超时或错误
+  // 设置超时时间
+  const int MAX_RETRIES = 5;
+  const int RETRY_INTERVAL_MS = 1000;
+  int remaining_timeout = timeout_ms;
+
+  for (int retry = 0; retry < MAX_RETRIES; ++retry) {
+    struct pollfd pfd;
+    pfd.fd = server_socket_fd_;
+    pfd.events = POLLIN;
+
+    int poll_timeout =
+        (timeout_ms == 0)
+            ? -1
+            : (remaining_timeout > RETRY_INTERVAL_MS ? RETRY_INTERVAL_MS
+                                                     : remaining_timeout);
+
+    int poll_result = poll(&pfd, 1, poll_timeout);
     if (poll_result < 0) {
-      error_msg_ = "Poll error: " + std::string(strerror(errno));
-      state_ = ConnectionState::ERROR;
+      std::cerr << "Poll error (attempt " << retry + 1
+                << "): " << strerror(errno) << std::endl;
+      continue;
+    } else if (poll_result == 0) {
+      std::cout << "Waiting for connection (attempt " << retry + 1 << ")..."
+                << std::endl;
+      if (timeout_ms > 0) {
+        remaining_timeout -= poll_timeout;
+        if (remaining_timeout <= 0) {
+          std::cerr << "Connection timeout after " << timeout_ms << "ms"
+                    << std::endl;
+          return false;
+        }
+      }
+      continue;
     }
-    return false;
+
+    struct sockaddr_in client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+
+    client_socket_fd_ = accept(
+        server_socket_fd_, (struct sockaddr *)&client_addr, &client_addr_len);
+    if (client_socket_fd_ < 0) {
+      std::cerr << "Accept failed (attempt " << retry + 1
+                << "): " << strerror(errno) << std::endl;
+      continue;
+    }
+
+    // 连接成功
+    char client_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
+    std::cout << "Client connected from " << client_ip << ":"
+              << ntohs(client_addr.sin_port) << std::endl;
+
+    // 保存客户端IP地址
+    peer_address_ = client_ip;
+    peer_port_ = ntohs(client_addr.sin_port);
+
+    socket_fd_ = client_socket_fd_;
+    state_ = ConnectionState::CONNECTED;
+    return true;
   }
 
-  struct sockaddr_in client_addr;
-  socklen_t client_addr_len = sizeof(client_addr);
-
-  client_socket_fd_ = accept(server_socket_fd_, (struct sockaddr *)&client_addr,
-                             &client_addr_len);
-  if (client_socket_fd_ < 0) {
-    error_msg_ = "Failed to accept connection: " + std::string(strerror(errno));
-    state_ = ConnectionState::ERROR;
-    return false;
-  }
-
-  // 保存客户端IP地址
-  char client_ip[INET_ADDRSTRLEN];
-  inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
-  peer_address_ = client_ip;
-  peer_port_ = ntohs(client_addr.sin_port);
-
-  socket_fd_ = client_socket_fd_;
-  state_ = ConnectionState::CONNECTED;
-  return true;
+  // 如果执行到这里，说明所有重试都失败了
+  error_msg_ = "Failed to accept connection after " +
+               std::to_string(MAX_RETRIES) + " attempts";
+  std::cerr << error_msg_ << std::endl;
+  state_ = ConnectionState::ERROR;
+  return false;
 }
 
 bool RdmaControlChannel::connect_to_server(const std::string &server_ip,
@@ -114,13 +181,19 @@ bool RdmaControlChannel::connect_to_server(const std::string &server_ip,
   std::lock_guard<std::mutex> lock(mutex_);
 
   if (state_ != ConnectionState::DISCONNECTED) {
+    std::cerr << "Invalid state for connecting to server. State: "
+              << static_cast<int>(state_) << std::endl;
     return false;
   }
+
+  std::cout << "Connecting to server at " << server_ip << ":" << port
+            << std::endl;
 
   // 创建客户端socket
   socket_fd_ = socket(AF_INET, SOCK_STREAM, 0);
   if (socket_fd_ < 0) {
     error_msg_ = "Failed to create socket: " + std::string(strerror(errno));
+    std::cerr << error_msg_ << std::endl;
     state_ = ConnectionState::ERROR;
     return false;
   }
@@ -133,33 +206,80 @@ bool RdmaControlChannel::connect_to_server(const std::string &server_ip,
 
   if (inet_pton(AF_INET, server_ip.c_str(), &server_addr.sin_addr) <= 0) {
     error_msg_ = "Invalid address: " + server_ip;
+    std::cerr << error_msg_ << std::endl;
     close(socket_fd_);
     socket_fd_ = -1;
     state_ = ConnectionState::ERROR;
     return false;
   }
 
-  // 连接到服务器
-  if (connect(socket_fd_, (struct sockaddr *)&server_addr,
-              sizeof(server_addr)) < 0) {
-    error_msg_ = "Connection failed: " + std::string(strerror(errno));
+  // 添加连接重试机制
+  const int MAX_RETRIES = 5;
+  const int RETRY_INTERVAL_MS = 1000;
+
+  for (int retry = 0; retry < MAX_RETRIES; ++retry) {
+    std::cout << "Attempting to connect (attempt " << retry + 1 << ")..."
+              << std::endl;
+
+    if (connect(socket_fd_, (struct sockaddr *)&server_addr,
+                sizeof(server_addr)) == 0) {
+      // 连接成功
+      std::cout << "Successfully connected to " << server_ip << ":" << port
+                << std::endl;
+      peer_address_ = server_ip;
+      peer_port_ = port;
+      state_ = ConnectionState::CONNECTED;
+      return true;
+    }
+
+    // 连接失败，记录错误并重试
+    error_msg_ = "Connection attempt " + std::to_string(retry + 1) +
+                 " failed: " + std::string(strerror(errno));
+    std::cerr << error_msg_ << std::endl;
+
+    // 最后一次尝试失败
+    if (retry == MAX_RETRIES - 1) {
+      close(socket_fd_);
+      socket_fd_ = -1;
+      state_ = ConnectionState::ERROR;
+      return false;
+    }
+
+    // 等待一段时间后重试
+    std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_INTERVAL_MS));
+
+    // 重新创建socket
     close(socket_fd_);
-    socket_fd_ = -1;
-    state_ = ConnectionState::ERROR;
-    return false;
+    socket_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+    if (socket_fd_ < 0) {
+      error_msg_ = "Failed to recreate socket: " + std::string(strerror(errno));
+      std::cerr << error_msg_ << std::endl;
+      state_ = ConnectionState::ERROR;
+      return false;
+    }
   }
 
-  peer_address_ = server_ip;
-  peer_port_ = port;
-  state_ = ConnectionState::CONNECTED;
-  return true;
+  // 如果执行到这里，说明所有重试都失败了
+  error_msg_ =
+      "Failed to connect after " + std::to_string(MAX_RETRIES) + " attempts";
+  std::cerr << error_msg_ << std::endl;
+  state_ = ConnectionState::ERROR;
+  return false;
 }
 
 bool RdmaControlChannel::send_connect_request(const QPValue &qp_info) {
+  std::cout << "Sending connect request with QP number: " << qp_info.qp_num
+            << std::endl;
   RdmaControlMsg msg;
   msg.type = RdmaControlMsgType::CONNECT_REQUEST;
   msg.qp_info = qp_info;
-  return send_message(msg);
+  bool result = send_message(msg);
+  if (result) {
+    std::cout << "Connect request sent successfully" << std::endl;
+  } else {
+    std::cerr << "Failed to send connect request: " << error_msg_ << std::endl;
+  }
+  return result;
 }
 
 bool RdmaControlChannel::send_connect_response(const QPValue &qp_info,
@@ -229,8 +349,15 @@ bool RdmaControlChannel::receive_message(RdmaControlMsg &msg,
   std::lock_guard<std::mutex> lock(mutex_);
 
   if (state_ != ConnectionState::CONNECTED || socket_fd_ < 0) {
+    error_msg_ =
+        "Cannot receive message: Socket not connected or invalid state";
+    std::cerr << error_msg_ << " (state=" << static_cast<int>(state_)
+              << ", socket_fd=" << socket_fd_ << ")" << std::endl;
     return false;
   }
+
+  std::cout << "Waiting to receive message (timeout: " << timeout_ms << "ms)..."
+            << std::endl;
 
   struct pollfd pfd;
   pfd.fd = socket_fd_;
@@ -241,22 +368,46 @@ bool RdmaControlChannel::receive_message(RdmaControlMsg &msg,
     // 超时或错误
     if (poll_result < 0) {
       error_msg_ = "Poll error: " + std::string(strerror(errno));
+      std::cerr << error_msg_ << std::endl;
       state_ = ConnectionState::ERROR;
+    } else {
+      error_msg_ = "Receive timeout after " + std::to_string(timeout_ms) + "ms";
+      std::cerr << error_msg_ << std::endl;
     }
     return false;
   }
 
+  std::cout << "Data available for reading" << std::endl;
+
   // 接收消息长度
   uint32_t net_msg_len;
-  if (recv(socket_fd_, &net_msg_len, sizeof(net_msg_len), 0) !=
-      sizeof(net_msg_len)) {
-    error_msg_ =
-        "Failed to receive message length: " + std::string(strerror(errno));
+  ssize_t recv_result = recv(socket_fd_, &net_msg_len, sizeof(net_msg_len), 0);
+  if (recv_result != sizeof(net_msg_len)) {
+    error_msg_ = "Failed to receive message length: ";
+    if (recv_result < 0) {
+      error_msg_ += std::string(strerror(errno));
+    } else if (recv_result == 0) {
+      error_msg_ += "Connection closed by peer";
+    } else {
+      error_msg_ += "Incomplete data (received " + std::to_string(recv_result) +
+                    " bytes, expected " + std::to_string(sizeof(net_msg_len)) +
+                    " bytes)";
+    }
+    std::cerr << error_msg_ << std::endl;
     state_ = ConnectionState::ERROR;
     return false;
   }
 
   uint32_t msg_len = ntohl(net_msg_len);
+  std::cout << "Message length received: " << msg_len << " bytes" << std::endl;
+
+  // 验证消息长度的合理性
+  if (msg_len > 4096 || msg_len == 0) {
+    error_msg_ = "Invalid message length: " + std::to_string(msg_len);
+    std::cerr << error_msg_ << std::endl;
+    state_ = ConnectionState::ERROR;
+    return false;
+  }
 
   // 接收消息内容
   std::string serialized_msg;
@@ -267,15 +418,32 @@ bool RdmaControlChannel::receive_message(RdmaControlMsg &msg,
     ssize_t result =
         recv(socket_fd_, &serialized_msg[received], msg_len - received, 0);
     if (result <= 0) {
-      error_msg_ = "Failed to receive message: " + std::string(strerror(errno));
+      error_msg_ = "Failed to receive message content: ";
+      if (result < 0) {
+        error_msg_ += std::string(strerror(errno));
+      } else {
+        error_msg_ += "Connection closed by peer";
+      }
+      std::cerr << error_msg_ << std::endl;
       state_ = ConnectionState::ERROR;
       return false;
     }
     received += result;
+    std::cout << "Received " << result << " bytes, total " << received << "/"
+              << msg_len << std::endl;
   }
 
+  std::cout << "Message content fully received, deserializing..." << std::endl;
+
   // 反序列化消息
-  return deserialize_message(serialized_msg, msg);
+  bool deserialize_result = deserialize_message(serialized_msg, msg);
+  if (deserialize_result) {
+    std::cout << "Message successfully deserialized, type="
+              << static_cast<int>(msg.type) << std::endl;
+  } else {
+    std::cerr << "Failed to deserialize message: " << error_msg_ << std::endl;
+  }
+  return deserialize_result;
 }
 
 RdmaControlChannel::ConnectionState RdmaControlChannel::get_state() const {

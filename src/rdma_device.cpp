@@ -3,9 +3,10 @@
 
 RdmaDevice::RdmaDevice(size_t max_connections, size_t max_qps, size_t max_cqs,
                        size_t max_mrs, size_t max_pds)
-    : max_connections_(max_connections), max_qps_(max_qps), max_cqs_(max_cqs),
-      max_mrs_(max_mrs), max_pds_(max_pds), should_stop_(false),
-      next_qp_num_(1), next_cq_num_(1), next_mr_lkey_(1), next_pd_handle_(1) {
+    : max_qps_(max_qps), max_cqs_(max_cqs), max_mrs_(max_mrs),
+      max_pds_(max_pds), next_qp_num_(1), next_cq_num_(1), next_mr_lkey_(1),
+      next_pd_handle_(1), should_stop_(false),
+      max_connections_(max_connections) {
 
   // 初始化缓存系统 - 缓存大小设置为设备资源限制的2倍，作为溢出缓存
   qp_cache_ = std::make_unique<RdmaQPCache>(max_qps * 2);
@@ -29,7 +30,8 @@ RdmaDevice::~RdmaDevice() {
   cleanup_resources();
 }
 
-uint32_t RdmaDevice::create_qp(uint32_t max_send_wr, uint32_t max_recv_wr) {
+uint32_t RdmaDevice::create_qp(uint32_t /*max_send_wr*/,
+                               uint32_t /*max_recv_wr*/) {
   std::lock_guard<std::mutex> lock(qp_mutex_);
 
   uint32_t qp_num = next_qp_num_++;
@@ -322,7 +324,7 @@ bool RdmaDevice::connect_qp(uint32_t qp_num, const QPValue &remote_info) {
   return true;
 }
 
-bool RdmaDevice::post_send(uint32_t qp_num, const RdmaWorkRequest &wr) {
+bool RdmaDevice::post_send(uint32_t qp_num, const RdmaWorkRequest & /*wr*/) {
   std::lock_guard<std::mutex> lock(qp_mutex_);
 
   // 首先在设备资源中查找
@@ -342,7 +344,7 @@ bool RdmaDevice::post_send(uint32_t qp_num, const RdmaWorkRequest &wr) {
   return true;
 }
 
-bool RdmaDevice::post_recv(uint32_t qp_num, const RdmaWorkRequest &wr) {
+bool RdmaDevice::post_recv(uint32_t qp_num, const RdmaWorkRequest & /*wr*/) {
   std::lock_guard<std::mutex> lock(qp_mutex_);
 
   // 首先在设备资源中查找
@@ -388,7 +390,7 @@ bool RdmaDevice::poll_cq(uint32_t cq_num,
   return cq_cache_->batch_get_completions(cq_num, max_entries).size() > 0;
 }
 
-bool RdmaDevice::req_notify_cq(uint32_t cq_num, bool solicited_only) {
+bool RdmaDevice::req_notify_cq(uint32_t cq_num, bool /*solicited_only*/) {
   std::lock_guard<std::mutex> lock(cq_mutex_);
 
   // 首先在设备资源中查找
