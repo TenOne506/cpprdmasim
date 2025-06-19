@@ -60,8 +60,8 @@ void device_a_thread() {
 
   // 创建资源
   uint32_t pd_a = device_a.create_pd();
-  uint32_t cq_a = device_a.create_cq(16);   // 创建完成队列，深度为16
-  uint32_t qp_a = device_a.create_qp(8, 8); // 创建QP，发送和接收队列深度都为8
+  uint32_t cq_a = device_a.create_cq(16); // 创建完成队列，深度为16
+  uint32_t qp_a = device_a.create_qp(8, 8, cq_a, cq_a); // 创建QP，使用同一个CQ
   std::cout << "Device A: Created resources (PD=" << pd_a << ", CQ=" << cq_a
             << ", QP=" << qp_a << ")" << std::endl;
 
@@ -276,7 +276,7 @@ void device_b_thread() {
   // 创建资源
   uint32_t pd_b = device_b.create_pd();
   uint32_t cq_b = device_b.create_cq(16);
-  uint32_t qp_b = device_b.create_qp(8, 8);
+  uint32_t qp_b = device_b.create_qp(8, 8, cq_b, cq_b); // 创建QP，使用同一个CQ
   std::cout << "Device B: Created resources (PD=" << pd_b << ", CQ=" << cq_b
             << ", QP=" << qp_b << ")" << std::endl;
 

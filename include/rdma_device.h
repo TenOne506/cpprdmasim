@@ -49,7 +49,8 @@ public:
   ~RdmaDevice();
 
   // 基本资源管理函数
-  uint32_t create_qp(uint32_t max_send_wr, uint32_t max_recv_wr);
+  uint32_t create_qp(uint32_t max_send_wr, uint32_t max_recv_wr,
+                     uint32_t send_cq, uint32_t recv_cq);
   uint32_t create_cq(uint32_t max_cqe);
   uint32_t register_mr(void *addr, size_t length, uint32_t access_flags);
   uint32_t create_pd();

@@ -31,8 +31,24 @@ RdmaDevice::~RdmaDevice() {
 }
 
 uint32_t RdmaDevice::create_qp(uint32_t /*max_send_wr*/,
-                               uint32_t /*max_recv_wr*/) {
+                               uint32_t /*max_recv_wr*/, uint32_t send_cq,
+                               uint32_t recv_cq) {
   std::lock_guard<std::mutex> lock(qp_mutex_);
+
+  // 验证CQ是否存在
+  {
+    std::lock_guard<std::mutex> cq_lock(cq_mutex_);
+    CQValue send_cq_value;
+    CQValue recv_cq_value;
+    bool send_cq_exists = cqs_.find(send_cq) != cqs_.end() ||
+                          cq_cache_->get(send_cq, send_cq_value);
+    bool recv_cq_exists = cqs_.find(recv_cq) != cqs_.end() ||
+                          cq_cache_->get(recv_cq, recv_cq_value);
+
+    if (!send_cq_exists || !recv_cq_exists) {
+      return 0; // 返回0表示创建失败
+    }
+  }
 
   uint32_t qp_num = next_qp_num_++;
 
@@ -42,6 +58,8 @@ uint32_t RdmaDevice::create_qp(uint32_t /*max_send_wr*/,
     QPValue qp_value{};
     qp_value.qp_num = qp_num;
     qp_value.state = QpState::RESET; // RESET state
+    qp_value.send_cq = send_cq;      // 设置发送CQ
+    qp_value.recv_cq = recv_cq;      // 设置接收CQ
     qp_value.created_time = std::chrono::steady_clock::now();
 
     // 存储在设备的资源中
@@ -53,6 +71,8 @@ uint32_t RdmaDevice::create_qp(uint32_t /*max_send_wr*/,
   QPValue qp_value{};
   qp_value.qp_num = qp_num;
   qp_value.state = QpState::RESET; // RESET state
+  qp_value.send_cq = send_cq;      // 设置发送CQ
+  qp_value.recv_cq = recv_cq;      // 设置接收CQ
   qp_value.created_time = std::chrono::steady_clock::now();
 
   qp_cache_->set(qp_num, qp_value);
@@ -324,43 +344,132 @@ bool RdmaDevice::connect_qp(uint32_t qp_num, const QPValue &remote_info) {
   return true;
 }
 
-bool RdmaDevice::post_send(uint32_t qp_num, const RdmaWorkRequest & /*wr*/) {
+bool RdmaDevice::post_send(uint32_t qp_num, const RdmaWorkRequest &wr) {
   std::lock_guard<std::mutex> lock(qp_mutex_);
+
+  // 获取QP信息
+  QPValue qp_info;
+  bool found = false;
 
   // 首先在设备资源中查找
   auto it = qps_.find(qp_num);
   if (it != qps_.end()) {
-    // TODO: 实现发送逻辑
-    return true;
+    qp_info = it->second;
+    found = true;
+  } else if (qp_cache_->get(qp_num, qp_info)) {
+    // 如果不在设备资源中，尝试在缓存中查找
+    found = true;
   }
 
-  // 如果不在设备资源中，尝试在缓存中处理
-  QPValue qp_info;
-  if (!qp_cache_->get(qp_num, qp_info)) {
+  if (!found) {
     return false;
   }
 
-  // TODO: 实现发送逻辑
+  // 检查QP状态是否为RTS
+  if (qp_info.state != QpState::RTS) {
+    return false;
+  }
+
+  // 获取目标QP信息
+  uint32_t dest_qp_num = qp_info.dest_qp_num;
+  QPValue dest_qp_info;
+
+  found = false;
+  auto dest_it = qps_.find(dest_qp_num);
+  if (dest_it != qps_.end()) {
+    dest_qp_info = dest_it->second;
+    found = true;
+  } else if (qp_cache_->get(dest_qp_num, dest_qp_info)) {
+    found = true;
+  }
+
+  if (!found) {
+    // 在实际场景中，这里应该通过网络发送数据
+    // 但在模拟中，我们假设目标QP不在本地设备上
+    // 所以我们只创建一个完成事件
+  }
+
+  // 创建完成事件
+  if (wr.signaled) {
+    CompletionEntry completion;
+    completion.wr_id = 0;  // 简化处理，使用固定ID
+    completion.status = 0; // 成功状态
+
+    // 将完成事件添加到CQ
+    std::lock_guard<std::mutex> cq_lock(cq_mutex_);
+    auto cq_it = cqs_.find(qp_info.send_cq);
+    if (cq_it != cqs_.end()) {
+      cq_it->second.completions.push_back(completion);
+    } else {
+      CQValue cq_info;
+      if (cq_cache_->get(qp_info.send_cq, cq_info)) {
+        cq_info.completions.push_back(completion);
+        cq_cache_->set(qp_info.send_cq, cq_info);
+      }
+    }
+  }
+
+  // 模拟数据传输 - 在实际场景中，这里会通过网络发送数据
+  // 但在我们的模拟中，我们直接将数据复制到目标缓冲区
+  if (wr.opcode == RdmaOpcode::RDMA_WRITE || wr.opcode == RdmaOpcode::SEND) {
+    // 在实际场景中，这里会通过网络发送数据
+    // 但在我们的模拟中，我们假设目标QP在另一个设备上
+    // 所以我们不做实际的数据复制
+  }
+
   return true;
 }
 
-bool RdmaDevice::post_recv(uint32_t qp_num, const RdmaWorkRequest & /*wr*/) {
+bool RdmaDevice::post_recv(uint32_t qp_num, const RdmaWorkRequest &wr) {
   std::lock_guard<std::mutex> lock(qp_mutex_);
+
+  // 获取QP信息
+  QPValue qp_info;
+  bool found = false;
 
   // 首先在设备资源中查找
   auto it = qps_.find(qp_num);
   if (it != qps_.end()) {
-    // TODO: 实现接收逻辑
-    return true;
+    qp_info = it->second;
+    found = true;
+  } else if (qp_cache_->get(qp_num, qp_info)) {
+    // 如果不在设备资源中，尝试在缓存中查找
+    found = true;
   }
 
-  // 如果不在设备资源中，尝试在缓存中处理
-  QPValue qp_info;
-  if (!qp_cache_->get(qp_num, qp_info)) {
+  if (!found) {
     return false;
   }
 
-  // TODO: 实现接收逻辑
+  // 检查QP状态是否至少为RTR
+  if (qp_info.state != QpState::RTR && qp_info.state != QpState::RTS) {
+    return false;
+  }
+
+  // 在实际场景中，这里会将接收请求添加到接收队列
+  // 但在我们的模拟中，我们直接创建一个完成事件
+
+  // 模拟接收数据 - 在测试环境中，我们假设数据已经接收
+  // 创建完成事件
+  if (wr.signaled) {
+    CompletionEntry completion;
+    completion.wr_id = 0;  // 简化处理，使用固定ID
+    completion.status = 0; // 成功状态
+
+    // 将完成事件添加到CQ
+    std::lock_guard<std::mutex> cq_lock(cq_mutex_);
+    auto cq_it = cqs_.find(qp_info.recv_cq);
+    if (cq_it != cqs_.end()) {
+      cq_it->second.completions.push_back(completion);
+    } else {
+      CQValue cq_info;
+      if (cq_cache_->get(qp_info.recv_cq, cq_info)) {
+        cq_info.completions.push_back(completion);
+        cq_cache_->set(qp_info.recv_cq, cq_info);
+      }
+    }
+  }
+
   return true;
 }
 

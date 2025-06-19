@@ -72,12 +72,14 @@ struct QPValue {
   std::array<uint8_t, 16> remote_gid; // 对端 GID
   uint32_t mtu;                       // 最大传输单元
   QpState state;                      // 当前状态
+  uint32_t send_cq;                   // 发送完成队列
+  uint32_t recv_cq;                   // 接收完成队列
   std::chrono::steady_clock::time_point created_time;
 
   QPValue()
       : qp_num(0), dest_qp_num(0), lid(0), remote_lid(0), port_num(1),
         qp_access_flags(0), psn(0), remote_psn(0), mtu(1024),
-        state(QpState::RESET) {
+        state(QpState::RESET), send_cq(0), recv_cq(0) {
     gid.fill(0);
     remote_gid.fill(0);
   }
