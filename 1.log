@@ -1,0 +1,94 @@
+Device A: Starting...
+Device B: Starting...
+Device A: Created RDMA device
+Device A: Attempting to start server on port Device B: Created RDMA device
+Device B: Waiting for server to start...
+5566
+Starting control channel server on port 5566
+Created server socket: 3
+Set SO_REUSEADDR option
+Binding to port 5566 (INADDR_ANY)...
+Successfully bound to port 5566
+Starting to listen for connections...
+Server successfully started on port 5566
+Device A: Successfully started control channel server on port 5566
+Device A: Created resources (PD=1, CQ=1, QP=1)
+Device A: Registered send buffer (MR=1)
+Device A: Registered receive buffer (MR=2)
+Device A: Waiting for client connection...
+Waiting for client connection...
+Waiting for connection (attempt 1)...
+Waiting for connection (attempt 2)...
+Device B: Connecting to server at 127.0.0.1:5566
+Connecting to server at 127.0.0.1:5566
+Attempting to connect (attempt 1)...
+Successfully connected to 127.0.0.1:5566
+Client connected from 127.0.0.1:54693
+Device A: Client connected from 127.0.0.1:54693
+Device A: Sending connect request with QP=1
+Sending connect request with QP number: 1
+Device B: Successfully connected to server
+Device B: Created resources (PD=1, CQ=1, QP=Connect request sent successfully1)
+
+Device A: Connect request sent successfully
+Device A: Waiting for connect response...
+Device B: Registered receive buffer (MR=1)
+Device B: Registered send buffer (MR=2)
+Device B: Waiting for connect request from Device A...
+Waiting to receive message (timeout: 10000ms)...
+Data available for reading
+Message length received: 68 bytes
+Received 68 bytes, total 68/68
+Message content fully received, deserializing...
+Waiting to receive message (timeout: Message successfully deserialized, type=0
+Device B: Received connect request, type=0, QP=1
+Device B: Sending connect response with QP=1
+5000ms)...
+Data available for reading
+Message length received: 68 bytes
+Device B: Connect response sent successfully
+Device B: Connecting QP with remote info (QP=1)
+Device B: QP connected successfully
+Device B: Transitioning QP through states...Received 68 bytes, total 68/68
+Message content fully received, deserializing...
+
+Message successfully deserialized, type=Device B: QP state transitions completed
+Device B: Waiting for ready message from Device A...
+Waiting to receive message (timeout: 5000ms)...
+1
+Device A: Received connect response, type=1
+Device A: Connection accepted by Device B
+Device A: Connecting QP with remote info (QP=1)
+Device A: QP connected successfully
+Device A: Transitioning QP through states...
+Device A: QP state transitions completed
+Device A: Sending ready message
+Device A: Ready message sent
+Device A: Waiting for ready message from Device B...
+Waiting to receive message (timeout: 5000ms)...
+Data available for reading
+Message length received: 68 bytes
+Received 68 bytes, total 68/68
+Message content fully received, deserializing...
+Message successfully deserialized, type=2
+Device B: Received ready message from Device A
+Device B: Sending ready message
+Device B: Ready message sent
+Found QP 1 in device resources
+Updated QP 1 receive buffer: addr=0x13f808200, length=Data available for reading
+Message length received: 1024
+Updated global QP map for QP 1
+68 bytes
+Received 68 bytes, total 68/68
+Message content fully received, deserializing...
+Message successfully deserialized, type=2
+Device A: Received ready message from Device B
+Device A: Sending message: "Hello RDMA!"
+Added completion to device CQ 1
+Device A: Message sent successfully
+Found QP 1 in device resources
+Updated QP 1 receive buffer: addr=0x0, length=0
+Updated global QP map for QP 1
+Device A: Received response: "Hello RDMA!"
+Device A: Cleaning up resources
+Device A: Resources cleaned up

@@ -1,6 +1,7 @@
 #ifndef RDMA_TYPES_H
 #define RDMA_TYPES_H
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -76,10 +77,16 @@ struct QPValue {
   uint32_t recv_cq;                   // 接收完成队列
   std::chrono::steady_clock::time_point created_time;
 
+  // 用于模拟数据传输的字段
+  void *recv_addr;                // 接收缓冲区地址
+  uint32_t recv_length;           // 接收缓冲区长度
+  std::vector<char> pending_data; // 待处理的数据（当接收缓冲区未准备好时）
+
   QPValue()
       : qp_num(0), dest_qp_num(0), lid(0), remote_lid(0), port_num(1),
         qp_access_flags(0), psn(0), remote_psn(0), mtu(1024),
-        state(QpState::RESET), send_cq(0), recv_cq(0) {
+        state(QpState::RESET), send_cq(0), recv_cq(0), recv_addr(nullptr),
+        recv_length(0) {
     gid.fill(0);
     remote_gid.fill(0);
   }

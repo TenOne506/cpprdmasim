@@ -5,7 +5,7 @@
 #include <string>
 #include <thread>
 
-const uint16_t CONTROL_PORT = 5565;
+const uint16_t CONTROL_PORT = 5566;
 const size_t MSG_SIZE = 1024;
 const std::string TEST_MSG = "Hello RDMA!";
 

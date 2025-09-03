@@ -67,8 +67,12 @@ bool test_qp_operations() {
 
   RdmaDevice device;
 
+  // 创建CQ
+  uint32_t cq = device.create_cq(16);
+  TEST_ASSERT(cq != 0, "Failed to create completion queue");
+
   // 创建QP
-  uint32_t qp = device.create_qp(8, 8);
+  uint32_t qp = device.create_qp(8, 8, cq, cq);
   TEST_ASSERT(qp != 0, "Failed to create queue pair");
   std::cout << "Created QP: " << qp << " with send/recv depth 8" << std::endl;
 
@@ -77,7 +81,7 @@ bool test_qp_operations() {
   std::cout << "Destroyed QP: " << qp << std::endl;
 
   // 尝试创建无效深度的QP
-  uint32_t invalid_qp = device.create_qp(0, 8);
+  uint32_t invalid_qp = device.create_qp(0, 8, cq, cq);
   TEST_ASSERT(invalid_qp == 0,
               "Creating QP with invalid send depth should fail");
   std::cout << "Successfully detected invalid QP creation attempt" << std::endl;
@@ -124,8 +128,12 @@ bool test_qp_state_transitions() {
 
   RdmaDevice device;
 
+  // 创建CQ
+  uint32_t cq = device.create_cq(16);
+  TEST_ASSERT(cq != 0, "Failed to create completion queue");
+
   // 创建QP
-  uint32_t qp = device.create_qp(8, 8);
+  uint32_t qp = device.create_qp(8, 8, cq, cq);
   TEST_ASSERT(qp != 0, "Failed to create queue pair");
   std::cout << "Created QP: " << qp << std::endl;
 

@@ -1,6 +1,6 @@
 #include "../include/rdma_device.h"
+#include <iostream>
 #include <stdexcept>
-
 RdmaDevice::RdmaDevice(size_t max_connections, size_t max_qps, size_t max_cqs,
                        size_t max_mrs, size_t max_pds)
     : max_qps_(max_qps), max_cqs_(max_cqs), max_mrs_(max_mrs),
@@ -344,6 +344,12 @@ bool RdmaDevice::connect_qp(uint32_t qp_num, const QPValue &remote_info) {
   return true;
 }
 
+// 静态映射表，用于存储所有设备中的QP信息
+// 键是QP编号，值是指向QPValue的指针和指向RdmaDevice的指针
+static std::unordered_map<uint32_t, std::pair<QPValue *, RdmaDevice *>>
+    global_qp_map;
+static std::mutex global_qp_mutex;
+
 bool RdmaDevice::post_send(uint32_t qp_num, const RdmaWorkRequest &wr) {
   std::lock_guard<std::mutex> lock(qp_mutex_);
 
@@ -356,6 +362,10 @@ bool RdmaDevice::post_send(uint32_t qp_num, const RdmaWorkRequest &wr) {
   if (it != qps_.end()) {
     qp_info = it->second;
     found = true;
+
+    // 将QP信息添加到全局映射表
+    std::lock_guard<std::mutex> global_lock(global_qp_mutex);
+    global_qp_map[qp_num] = std::make_pair(&(it->second), this);
   } else if (qp_cache_->get(qp_num, qp_info)) {
     // 如果不在设备资源中，尝试在缓存中查找
     found = true;
@@ -370,51 +380,96 @@ bool RdmaDevice::post_send(uint32_t qp_num, const RdmaWorkRequest &wr) {
     return false;
   }
 
-  // 获取目标QP信息
-  uint32_t dest_qp_num = qp_info.dest_qp_num;
-  QPValue dest_qp_info;
-
-  found = false;
-  auto dest_it = qps_.find(dest_qp_num);
-  if (dest_it != qps_.end()) {
-    dest_qp_info = dest_it->second;
-    found = true;
-  } else if (qp_cache_->get(dest_qp_num, dest_qp_info)) {
-    found = true;
-  }
-
-  if (!found) {
-    // 在实际场景中，这里应该通过网络发送数据
-    // 但在模拟中，我们假设目标QP不在本地设备上
-    // 所以我们只创建一个完成事件
-  }
-
   // 创建完成事件
   if (wr.signaled) {
     CompletionEntry completion;
-    completion.wr_id = 0;  // 简化处理，使用固定ID
+    completion.wr_id = wr.wr_id;
     completion.status = 0; // 成功状态
+    completion.opcode = wr.opcode;
+    completion.length = wr.length;
 
     // 将完成事件添加到CQ
     std::lock_guard<std::mutex> cq_lock(cq_mutex_);
     auto cq_it = cqs_.find(qp_info.send_cq);
     if (cq_it != cqs_.end()) {
       cq_it->second.completions.push_back(completion);
+      std::cout << "Added completion to device CQ " << qp_info.send_cq
+                << std::endl;
     } else {
       CQValue cq_info;
       if (cq_cache_->get(qp_info.send_cq, cq_info)) {
         cq_info.completions.push_back(completion);
         cq_cache_->set(qp_info.send_cq, cq_info);
+        std::cout << "Added completion to cached CQ " << qp_info.send_cq
+                  << std::endl;
+      } else {
+        std::cerr << "Failed to find CQ " << qp_info.send_cq
+                  << " for completion" << std::endl;
       }
     }
   }
 
   // 模拟数据传输 - 在实际场景中，这里会通过网络发送数据
-  // 但在我们的模拟中，我们直接将数据复制到目标缓冲区
   if (wr.opcode == RdmaOpcode::RDMA_WRITE || wr.opcode == RdmaOpcode::SEND) {
-    // 在实际场景中，这里会通过网络发送数据
-    // 但在我们的模拟中，我们假设目标QP在另一个设备上
-    // 所以我们不做实际的数据复制
+    uint32_t dest_qp_num = qp_info.dest_qp_num;
+
+    // 在全局映射表中查找目标QP
+    QPValue *dest_qp_ptr = nullptr;
+    RdmaDevice *dest_device = nullptr;
+
+    {
+      std::lock_guard<std::mutex> global_lock(global_qp_mutex);
+      auto dest_it = global_qp_map.find(dest_qp_num);
+      if (dest_it != global_qp_map.end()) {
+        dest_qp_ptr = dest_it->second.first;
+        dest_device = dest_it->second.second;
+      }
+    }
+
+    // 如果找到目标QP，执行数据传输
+    if (dest_qp_ptr && dest_device) {
+      // 执行数据复制，即使目标QP当前没有接收缓冲区也要保存数据
+      if (dest_qp_ptr->recv_addr != nullptr) {
+        size_t copy_size = std::min(wr.length, dest_qp_ptr->recv_length);
+        memcpy(dest_qp_ptr->recv_addr, wr.local_addr, copy_size);
+
+        // 创建接收完成事件
+        CompletionEntry recv_completion;
+        recv_completion.wr_id = 0;  // 简化处理
+        recv_completion.status = 0; // 成功状态
+        recv_completion.length = copy_size;
+        recv_completion.opcode = RdmaOpcode::RECV;
+
+        // 将完成事件添加到接收CQ
+        std::lock_guard<std::mutex> dest_cq_lock(dest_device->cq_mutex_);
+        auto dest_cq_it = dest_device->cqs_.find(dest_qp_ptr->recv_cq);
+        if (dest_cq_it != dest_device->cqs_.end()) {
+          dest_cq_it->second.completions.push_back(recv_completion);
+          std::cout << "Added receive completion to device CQ "
+                    << dest_qp_ptr->recv_cq << std::endl;
+        } else {
+          CQValue dest_cq_info;
+          if (dest_device->cq_cache_->get(dest_qp_ptr->recv_cq, dest_cq_info)) {
+            dest_cq_info.completions.push_back(recv_completion);
+            dest_device->cq_cache_->set(dest_qp_ptr->recv_cq, dest_cq_info);
+            std::cout << "Added receive completion to cached CQ "
+                      << dest_qp_ptr->recv_cq << std::endl;
+          } else {
+            std::cerr << "Failed to find receive CQ " << dest_qp_ptr->recv_cq
+                      << " for completion" << std::endl;
+          }
+        }
+
+        // 清除接收缓冲区信息，表示已经使用过了
+        dest_qp_ptr->recv_addr = nullptr;
+        dest_qp_ptr->recv_length = 0;
+      } else {
+        // 如果目标QP没有接收缓冲区，先保存数据
+        dest_qp_ptr->pending_data.assign(
+            static_cast<const char *>(wr.local_addr),
+            static_cast<const char *>(wr.local_addr) + wr.length);
+      }
+    }
   }
 
   return true;
@@ -426,18 +481,23 @@ bool RdmaDevice::post_recv(uint32_t qp_num, const RdmaWorkRequest &wr) {
   // 获取QP信息
   QPValue qp_info;
   bool found = false;
+  bool is_cached = false;
 
   // 首先在设备资源中查找
   auto it = qps_.find(qp_num);
   if (it != qps_.end()) {
     qp_info = it->second;
     found = true;
+    std::cout << "Found QP " << qp_num << " in device resources" << std::endl;
   } else if (qp_cache_->get(qp_num, qp_info)) {
     // 如果不在设备资源中，尝试在缓存中查找
     found = true;
+    is_cached = true;
+    std::cout << "Found QP " << qp_num << " in cache" << std::endl;
   }
 
   if (!found) {
+    std::cerr << "QP " << qp_num << " not found for post_recv" << std::endl;
     return false;
   }
 
@@ -446,28 +506,64 @@ bool RdmaDevice::post_recv(uint32_t qp_num, const RdmaWorkRequest &wr) {
     return false;
   }
 
-  // 在实际场景中，这里会将接收请求添加到接收队列
-  // 但在我们的模拟中，我们直接创建一个完成事件
+  // 保存接收缓冲区信息
+  qp_info.recv_addr = wr.local_addr;
+  qp_info.recv_length = wr.length;
 
-  // 模拟接收数据 - 在测试环境中，我们假设数据已经接收
-  // 创建完成事件
-  if (wr.signaled) {
-    CompletionEntry completion;
-    completion.wr_id = 0;  // 简化处理，使用固定ID
-    completion.status = 0; // 成功状态
+  // 检查是否有待处理的数据
+  if (!qp_info.pending_data.empty()) {
+    // 有待处理数据，复制到接收缓冲区
+    size_t copy_size =
+        std::min(qp_info.pending_data.size(), (unsigned long)wr.length);
+    memcpy(wr.local_addr, qp_info.pending_data.data(), copy_size);
+
+    // 创建接收完成事件
+    CompletionEntry recv_completion;
+    recv_completion.wr_id = wr.wr_id;
+    recv_completion.status = 0; // 成功状态
+    recv_completion.length = copy_size;
+    recv_completion.opcode = RdmaOpcode::RECV;
 
     // 将完成事件添加到CQ
     std::lock_guard<std::mutex> cq_lock(cq_mutex_);
     auto cq_it = cqs_.find(qp_info.recv_cq);
     if (cq_it != cqs_.end()) {
-      cq_it->second.completions.push_back(completion);
+      cq_it->second.completions.push_back(recv_completion);
     } else {
       CQValue cq_info;
       if (cq_cache_->get(qp_info.recv_cq, cq_info)) {
-        cq_info.completions.push_back(completion);
+        cq_info.completions.push_back(recv_completion);
         cq_cache_->set(qp_info.recv_cq, cq_info);
       }
     }
+
+    // 清除待处理数据和接收缓冲区信息
+    qp_info.pending_data.clear();
+    qp_info.recv_addr = nullptr;
+    qp_info.recv_length = 0;
+  }
+
+  // 更新QP信息
+  if (it != qps_.end()) {
+    it->second = qp_info;
+    std::cout << "Updated QP " << qp_num
+              << " receive buffer: addr=" << qp_info.recv_addr
+              << ", length=" << qp_info.recv_length << std::endl;
+
+    // 将更新后的QP信息添加到全局映射表
+    std::lock_guard<std::mutex> global_lock(global_qp_mutex);
+    global_qp_map[qp_num] = std::make_pair(&(it->second), this);
+    std::cout << "Updated global QP map for QP " << qp_num << std::endl;
+  } else {
+    qp_cache_->set(qp_num, qp_info);
+    std::cout << "Updated cached QP " << qp_num << " receive buffer"
+              << std::endl;
+  }
+
+  // 检查是否有待处理数据可以立即处理
+  if (!qp_info.pending_data.empty() && qp_info.recv_addr) {
+    std::cout << "Processing pending data for QP " << qp_num
+              << ", size=" << qp_info.pending_data.size() << std::endl;
   }
 
   return true;
@@ -482,21 +578,28 @@ bool RdmaDevice::poll_cq(uint32_t cq_num,
   // 首先在设备资源中查找
   auto it = cqs_.find(cq_num);
   if (it != cqs_.end()) {
-    if (it->second.completions.empty()) {
-      return false;
+    if (!it->second.completions.empty()) {
+      size_t num_entries = std::min(static_cast<size_t>(max_entries),
+                                    it->second.completions.size());
+      completions.insert(completions.end(), it->second.completions.begin(),
+                         it->second.completions.begin() + num_entries);
+      it->second.completions.erase(it->second.completions.begin(),
+                                   it->second.completions.begin() +
+                                       num_entries);
+      return true;
     }
+  }
 
-    size_t num_entries = std::min(static_cast<size_t>(max_entries),
-                                  it->second.completions.size());
-    completions.insert(completions.end(), it->second.completions.begin(),
-                       it->second.completions.begin() + num_entries);
-    it->second.completions.erase(it->second.completions.begin(),
-                                 it->second.completions.begin() + num_entries);
+  // 如果不在设备资源中或设备资源中没有完成事件，尝试从缓存中获取
+  auto cached_completions =
+      cq_cache_->batch_get_completions(cq_num, max_entries);
+  if (!cached_completions.empty()) {
+    completions.insert(completions.end(), cached_completions.begin(),
+                       cached_completions.end());
     return true;
   }
 
-  // 如果不在设备资源中，尝试从缓存中获取
-  return cq_cache_->batch_get_completions(cq_num, max_entries).size() > 0;
+  return false;
 }
 
 bool RdmaDevice::req_notify_cq(uint32_t cq_num, bool /*solicited_only*/) {
