@@ -45,6 +45,13 @@ target("rdma_communication_test")
     add_deps("rdmasim")
     add_links("pthread")
 
+-- 基准测试：缓存 vs 无缓存
+target("rdma_cache_benchmark")
+    set_kind("binary")
+    add_files("test/rdma_cache_benchmark.cpp")
+    add_deps("rdmasim")
+    add_links("pthread")
+
 -- 设置安装规则
 target("rdmasim")
     set_installdir("/usr/local")

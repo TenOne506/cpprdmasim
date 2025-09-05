@@ -81,12 +81,22 @@ public:
   bool get_cq_info(uint32_t cq_num, CQValue &info);
   bool get_mr_info(uint32_t lkey, MRValue &info);
 
+  // 模拟配置：启用/禁用中间缓存，以及设置主机交换/设备/中间缓存访问延迟（纳秒）
+  static void set_simulation_mode(bool enable_middle_cache,
+                                  uint32_t host_swap_delay_ns = 0,
+                                  uint32_t device_delay_ns = 0,
+                                  uint32_t middle_delay_ns = 0);
+
 private:
   // 设备自己的资源
   std::unordered_map<uint32_t, QPValue> qps_;
   std::unordered_map<uint32_t, CQValue> cqs_;
   std::unordered_map<uint32_t, MRValue> mrs_;
   std::unordered_map<uint32_t, PDValue> pds_;
+
+  // 主机交换（慢路径）存储，用于禁用中间缓存时承载溢出数据
+  std::unordered_map<uint32_t, QPValue> qps_host_;
+  std::unordered_map<uint32_t, CQValue> cqs_host_;
 
   // 资源容量限制
   size_t max_qps_;
@@ -123,6 +133,12 @@ private:
   void network_thread_func();
   bool validate_qp_transition(QpState current_state, QpState new_state);
   void cleanup_resources();
+
+  // 模拟配置（全局）
+  static std::atomic<bool> enable_middle_cache_;
+  static std::atomic<uint32_t> host_swap_delay_ns_;
+  static std::atomic<uint32_t> device_delay_ns_;
+  static std::atomic<uint32_t> middle_delay_ns_;
 };
 
 #endif // RDMA_DEVICE_H

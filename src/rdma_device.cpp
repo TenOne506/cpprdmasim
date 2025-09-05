@@ -1,6 +1,9 @@
 #include "../include/rdma_device.h"
 #include <iostream>
 #include <stdexcept>
+#include <atomic>
+#include <thread>
+#include <chrono>
 RdmaDevice::RdmaDevice(size_t max_connections, size_t max_qps, size_t max_cqs,
                        size_t max_mrs, size_t max_pds)
     : max_qps_(max_qps), max_cqs_(max_cqs), max_mrs_(max_mrs),
@@ -17,6 +20,28 @@ RdmaDevice::RdmaDevice(size_t max_connections, size_t max_qps, size_t max_cqs,
   // 启动网络处理线程
   network_thread_ =
       std::make_unique<std::thread>(&RdmaDevice::network_thread_func, this);
+}
+
+// 模拟配置（静态）
+std::atomic<bool> RdmaDevice::enable_middle_cache_{true};
+std::atomic<uint32_t> RdmaDevice::host_swap_delay_ns_{0};
+std::atomic<uint32_t> RdmaDevice::device_delay_ns_{0};
+std::atomic<uint32_t> RdmaDevice::middle_delay_ns_{0};
+
+void RdmaDevice::set_simulation_mode(bool enable_middle_cache,
+                                     uint32_t host_swap_delay_ns,
+                                     uint32_t device_delay_ns,
+                                     uint32_t middle_delay_ns) {
+  enable_middle_cache_.store(enable_middle_cache, std::memory_order_relaxed);
+  host_swap_delay_ns_.store(host_swap_delay_ns, std::memory_order_relaxed);
+  device_delay_ns_.store(device_delay_ns, std::memory_order_relaxed);
+  middle_delay_ns_.store(middle_delay_ns, std::memory_order_relaxed);
+}
+
+static inline void maybe_sleep_ns(uint32_t ns) {
+  if (ns > 0) {
+    std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
+  }
 }
 
 RdmaDevice::~RdmaDevice() {
@@ -40,10 +65,17 @@ uint32_t RdmaDevice::create_qp(uint32_t /*max_send_wr*/,
     std::lock_guard<std::mutex> cq_lock(cq_mutex_);
     CQValue send_cq_value;
     CQValue recv_cq_value;
-    bool send_cq_exists = cqs_.find(send_cq) != cqs_.end() ||
-                          cq_cache_->get(send_cq, send_cq_value);
-    bool recv_cq_exists = cqs_.find(recv_cq) != cqs_.end() ||
-                          cq_cache_->get(recv_cq, recv_cq_value);
+    bool send_cq_exists = cqs_.find(send_cq) != cqs_.end();
+    bool recv_cq_exists = cqs_.find(recv_cq) != cqs_.end();
+    if (!send_cq_exists || !recv_cq_exists) {
+      if (enable_middle_cache_.load(std::memory_order_relaxed)) {
+        send_cq_exists = send_cq_exists || cq_cache_->get(send_cq, send_cq_value);
+        recv_cq_exists = recv_cq_exists || cq_cache_->get(recv_cq, recv_cq_value);
+      } else {
+        send_cq_exists = send_cq_exists || (cqs_host_.find(send_cq) != cqs_host_.end());
+        recv_cq_exists = recv_cq_exists || (cqs_host_.find(recv_cq) != cqs_host_.end());
+      }
+    }
 
     if (!send_cq_exists || !recv_cq_exists) {
       return 0; // 返回0表示创建失败
@@ -54,6 +86,7 @@ uint32_t RdmaDevice::create_qp(uint32_t /*max_send_wr*/,
 
   // 检查设备资源是否已满
   if (qps_.size() < max_qps_) {
+    maybe_sleep_ns(device_delay_ns_.load(std::memory_order_relaxed));
     // 创建新的QP
     QPValue qp_value{};
     qp_value.qp_num = qp_num;
@@ -67,7 +100,7 @@ uint32_t RdmaDevice::create_qp(uint32_t /*max_send_wr*/,
     return qp_num;
   }
 
-  // 如果设备资源已满，尝试使用缓存
+  // 如果设备资源已满
   QPValue qp_value{};
   qp_value.qp_num = qp_num;
   qp_value.state = QpState::RESET; // RESET state
@@ -75,7 +108,13 @@ uint32_t RdmaDevice::create_qp(uint32_t /*max_send_wr*/,
   qp_value.recv_cq = recv_cq;      // 设置接收CQ
   qp_value.created_time = std::chrono::steady_clock::now();
 
-  qp_cache_->set(qp_num, qp_value);
+  if (enable_middle_cache_.load(std::memory_order_relaxed)) {
+    maybe_sleep_ns(middle_delay_ns_.load(std::memory_order_relaxed));
+    qp_cache_->set(qp_num, qp_value);
+  } else {
+    maybe_sleep_ns(host_swap_delay_ns_.load(std::memory_order_relaxed));
+    qps_host_[qp_num] = qp_value;
+  }
   return qp_num;
 }
 
@@ -86,6 +125,7 @@ uint32_t RdmaDevice::create_cq(uint32_t max_cqe) {
 
   // 检查设备资源是否已满
   if (cqs_.size() < max_cqs_) {
+    maybe_sleep_ns(device_delay_ns_.load(std::memory_order_relaxed));
     // 创建新的CQ
     CQValue cq_value{};
     cq_value.cq_num = cq_num;
@@ -95,12 +135,17 @@ uint32_t RdmaDevice::create_cq(uint32_t max_cqe) {
     return cq_num;
   }
 
-  // 如果设备资源已满，尝试使用缓存
+  // 如果设备资源已满
   CQValue cq_value{};
   cq_value.cq_num = cq_num;
   cq_value.cqe = max_cqe;
-
-  cq_cache_->set(cq_num, cq_value);
+  if (enable_middle_cache_.load(std::memory_order_relaxed)) {
+    maybe_sleep_ns(middle_delay_ns_.load(std::memory_order_relaxed));
+    cq_cache_->set(cq_num, cq_value);
+  } else {
+    maybe_sleep_ns(host_swap_delay_ns_.load(std::memory_order_relaxed));
+    cqs_host_[cq_num] = cq_value;
+  }
   return cq_num;
 }
 
@@ -169,8 +214,17 @@ bool RdmaDevice::get_qp_info(uint32_t qp_num, QPValue &info) {
     return true;
   }
 
-  // 如果在设备资源中找不到，尝试从缓存中获取
-  return qp_cache_->get(qp_num, info);
+  // 如果在设备资源中找不到
+  if (enable_middle_cache_.load(std::memory_order_relaxed)) {
+    return qp_cache_->get(qp_num, info);
+  } else {
+    auto hit = qps_host_.find(qp_num);
+    if (hit != qps_host_.end()) {
+      info = hit->second;
+      return true;
+    }
+    return false;
+  }
 }
 
 bool RdmaDevice::get_cq_info(uint32_t cq_num, CQValue &info) {
@@ -183,8 +237,17 @@ bool RdmaDevice::get_cq_info(uint32_t cq_num, CQValue &info) {
     return true;
   }
 
-  // 如果在设备资源中找不到，尝试从缓存中获取
-  return cq_cache_->get(cq_num, info);
+  if (enable_middle_cache_.load(std::memory_order_relaxed)) {
+    return cq_cache_->get(cq_num, info);
+  } else {
+    auto hit = cqs_host_.find(cq_num);
+    if (hit != cqs_host_.end()) {
+      maybe_sleep_ns(host_swap_delay_ns_.load(std::memory_order_relaxed));
+      info = hit->second;
+      return true;
+    }
+    return false;
+  }
 }
 
 bool RdmaDevice::get_mr_info(uint32_t lkey, MRValue &info) {
@@ -302,19 +365,28 @@ bool RdmaDevice::modify_qp_state(uint32_t qp_num, QpState new_state) {
     return true;
   }
 
-  // 如果不在设备资源中，尝试在缓存中修改
-  QPValue qp_info;
-  if (!qp_cache_->get(qp_num, qp_info)) {
-    return false;
+  // 如果不在设备资源中
+  if (enable_middle_cache_.load(std::memory_order_relaxed)) {
+    QPValue qp_info;
+    if (!qp_cache_->get(qp_num, qp_info)) {
+      return false;
+    }
+    if (!validate_qp_transition(qp_info.state, new_state)) {
+      return false;
+    }
+    qp_info.state = new_state;
+    maybe_sleep_ns(middle_delay_ns_.load(std::memory_order_relaxed));
+    qp_cache_->set(qp_num, qp_info);
+    return true;
+  } else {
+    auto it_host = qps_host_.find(qp_num);
+    if (it_host == qps_host_.end()) return false;
+    if (!validate_qp_transition(it_host->second.state, new_state)) {
+      return false;
+    }
+    it_host->second.state = new_state;
+    return true;
   }
-
-  if (!validate_qp_transition(qp_info.state, new_state)) {
-    return false;
-  }
-
-  qp_info.state = new_state;
-  qp_cache_->set(qp_num, qp_info);
-  return true;
 }
 
 bool RdmaDevice::connect_qp(uint32_t qp_num, const QPValue &remote_info) {
@@ -330,18 +402,26 @@ bool RdmaDevice::connect_qp(uint32_t qp_num, const QPValue &remote_info) {
     return true;
   }
 
-  // 如果不在设备资源中，尝试在缓存中修改
-  QPValue qp_info;
-  if (!qp_cache_->get(qp_num, qp_info)) {
-    return false;
+  if (enable_middle_cache_.load(std::memory_order_relaxed)) {
+    QPValue qp_info;
+    if (!qp_cache_->get(qp_num, qp_info)) {
+      return false;
+    }
+    qp_info.dest_qp_num = remote_info.qp_num;
+    qp_info.remote_lid = remote_info.lid;
+    qp_info.remote_psn = remote_info.psn;
+    qp_info.remote_gid = remote_info.gid;
+    qp_cache_->set(qp_num, qp_info);
+    return true;
+  } else {
+    auto it_host = qps_host_.find(qp_num);
+    if (it_host == qps_host_.end()) return false;
+    it_host->second.dest_qp_num = remote_info.qp_num;
+    it_host->second.remote_lid = remote_info.lid;
+    it_host->second.remote_psn = remote_info.psn;
+    it_host->second.remote_gid = remote_info.gid;
+    return true;
   }
-
-  qp_info.dest_qp_num = remote_info.qp_num;
-  qp_info.remote_lid = remote_info.lid;
-  qp_info.remote_psn = remote_info.psn;
-  qp_info.remote_gid = remote_info.gid;
-  qp_cache_->set(qp_num, qp_info);
-  return true;
 }
 
 // 静态映射表，用于存储所有设备中的QP信息
@@ -366,9 +446,21 @@ bool RdmaDevice::post_send(uint32_t qp_num, const RdmaWorkRequest &wr) {
     // 将QP信息添加到全局映射表
     std::lock_guard<std::mutex> global_lock(global_qp_mutex);
     global_qp_map[qp_num] = std::make_pair(&(it->second), this);
-  } else if (qp_cache_->get(qp_num, qp_info)) {
-    // 如果不在设备资源中，尝试在缓存中查找
-    found = true;
+  } else {
+    if (enable_middle_cache_.load(std::memory_order_relaxed)) {
+      if (qp_cache_->get(qp_num, qp_info)) {
+        found = true;
+      }
+    } else {
+      auto it_host = qps_host_.find(qp_num);
+      if (it_host != qps_host_.end()) {
+        qp_info = it_host->second;
+        found = true;
+        // 加入全局映射，指向 host 表中的对象
+        std::lock_guard<std::mutex> global_lock(global_qp_mutex);
+        global_qp_map[qp_num] = std::make_pair(&(it_host->second), this);
+      }
+    }
   }
 
   if (!found) {
@@ -398,13 +490,23 @@ bool RdmaDevice::post_send(uint32_t qp_num, const RdmaWorkRequest &wr) {
     } else {
       CQValue cq_info;
       if (cq_cache_->get(qp_info.send_cq, cq_info)) {
+        maybe_sleep_ns(middle_delay_ns_.load(std::memory_order_relaxed));
         cq_info.completions.push_back(completion);
         cq_cache_->set(qp_info.send_cq, cq_info);
         std::cout << "Added completion to cached CQ " << qp_info.send_cq
                   << std::endl;
       } else {
-        std::cerr << "Failed to find CQ " << qp_info.send_cq
-                  << " for completion" << std::endl;
+        // 尝试主机交换路径
+        auto host_it = cqs_host_.find(qp_info.send_cq);
+        if (host_it != cqs_host_.end()) {
+          maybe_sleep_ns(host_swap_delay_ns_.load(std::memory_order_relaxed));
+          host_it->second.completions.push_back(completion);
+          std::cout << "Added completion to host CQ " << qp_info.send_cq
+                    << std::endl;
+        } else {
+          std::cerr << "Failed to find CQ " << qp_info.send_cq
+                    << " for completion" << std::endl;
+        }
       }
     }
   }
@@ -450,13 +552,23 @@ bool RdmaDevice::post_send(uint32_t qp_num, const RdmaWorkRequest &wr) {
         } else {
           CQValue dest_cq_info;
           if (dest_device->cq_cache_->get(dest_qp_ptr->recv_cq, dest_cq_info)) {
+            maybe_sleep_ns(middle_delay_ns_.load(std::memory_order_relaxed));
             dest_cq_info.completions.push_back(recv_completion);
             dest_device->cq_cache_->set(dest_qp_ptr->recv_cq, dest_cq_info);
             std::cout << "Added receive completion to cached CQ "
                       << dest_qp_ptr->recv_cq << std::endl;
           } else {
-            std::cerr << "Failed to find receive CQ " << dest_qp_ptr->recv_cq
-                      << " for completion" << std::endl;
+            // 主机交换路径
+            auto host_it = dest_device->cqs_host_.find(dest_qp_ptr->recv_cq);
+            if (host_it != dest_device->cqs_host_.end()) {
+              maybe_sleep_ns(host_swap_delay_ns_.load(std::memory_order_relaxed));
+              host_it->second.completions.push_back(recv_completion);
+              std::cout << "Added receive completion to host CQ "
+                        << dest_qp_ptr->recv_cq << std::endl;
+            } else {
+              std::cerr << "Failed to find receive CQ " << dest_qp_ptr->recv_cq
+                        << " for completion" << std::endl;
+            }
           }
         }
 
@@ -489,11 +601,21 @@ bool RdmaDevice::post_recv(uint32_t qp_num, const RdmaWorkRequest &wr) {
     qp_info = it->second;
     found = true;
     std::cout << "Found QP " << qp_num << " in device resources" << std::endl;
-  } else if (qp_cache_->get(qp_num, qp_info)) {
-    // 如果不在设备资源中，尝试在缓存中查找
-    found = true;
-    is_cached = true;
-    std::cout << "Found QP " << qp_num << " in cache" << std::endl;
+  } else {
+    if (enable_middle_cache_.load(std::memory_order_relaxed)) {
+      if (qp_cache_->get(qp_num, qp_info)) {
+        found = true;
+        is_cached = true;
+        std::cout << "Found QP " << qp_num << " in cache" << std::endl;
+      }
+    } else {
+      auto it_host = qps_host_.find(qp_num);
+      if (it_host != qps_host_.end()) {
+        qp_info = it_host->second;
+        found = true;
+        std::cout << "Found QP " << qp_num << " in host table" << std::endl;
+      }
+    }
   }
 
   if (!found) {
@@ -532,6 +654,7 @@ bool RdmaDevice::post_recv(uint32_t qp_num, const RdmaWorkRequest &wr) {
     } else {
       CQValue cq_info;
       if (cq_cache_->get(qp_info.recv_cq, cq_info)) {
+        maybe_sleep_ns(middle_delay_ns_.load(std::memory_order_relaxed));
         cq_info.completions.push_back(recv_completion);
         cq_cache_->set(qp_info.recv_cq, cq_info);
       }
@@ -555,9 +678,15 @@ bool RdmaDevice::post_recv(uint32_t qp_num, const RdmaWorkRequest &wr) {
     global_qp_map[qp_num] = std::make_pair(&(it->second), this);
     std::cout << "Updated global QP map for QP " << qp_num << std::endl;
   } else {
-    qp_cache_->set(qp_num, qp_info);
-    std::cout << "Updated cached QP " << qp_num << " receive buffer"
-              << std::endl;
+    if (enable_middle_cache_.load(std::memory_order_relaxed)) {
+      qp_cache_->set(qp_num, qp_info);
+      std::cout << "Updated cached QP " << qp_num << " receive buffer"
+                << std::endl;
+    } else {
+      qps_host_[qp_num] = qp_info;
+      std::cout << "Updated host QP " << qp_num << " receive buffer"
+                << std::endl;
+    }
   }
 
   // 检查是否有待处理数据可以立即处理
@@ -590,13 +719,27 @@ bool RdmaDevice::poll_cq(uint32_t cq_num,
     }
   }
 
-  // 如果不在设备资源中或设备资源中没有完成事件，尝试从缓存中获取
-  auto cached_completions =
-      cq_cache_->batch_get_completions(cq_num, max_entries);
-  if (!cached_completions.empty()) {
-    completions.insert(completions.end(), cached_completions.begin(),
-                       cached_completions.end());
-    return true;
+  // 如果不在设备资源中或设备资源中没有完成事件，尝试从缓存/主机获取
+  if (enable_middle_cache_.load(std::memory_order_relaxed)) {
+    auto cached_completions =
+        cq_cache_->batch_get_completions(cq_num, max_entries);
+    if (!cached_completions.empty()) {
+      completions.insert(completions.end(), cached_completions.begin(),
+                         cached_completions.end());
+      return true;
+    }
+  } else {
+    auto hit = cqs_host_.find(cq_num);
+    if (hit != cqs_host_.end() && !hit->second.completions.empty()) {
+      maybe_sleep_ns(host_swap_delay_ns_.load(std::memory_order_relaxed));
+      size_t num_entries = std::min(static_cast<size_t>(max_entries),
+                                    hit->second.completions.size());
+      completions.insert(completions.end(), hit->second.completions.begin(),
+                         hit->second.completions.begin() + num_entries);
+      hit->second.completions.erase(hit->second.completions.begin(),
+                                    hit->second.completions.begin() + num_entries);
+      return true;
+    }
   }
 
   return false;

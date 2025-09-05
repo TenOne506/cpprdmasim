@@ -414,7 +414,42 @@ bool RdmaControlChannel::receive_message(RdmaControlMsg &msg,
   serialized_msg.resize(msg_len);
 
   size_t received = 0;
+  // 为正文接收实现超时控制：按剩余时间分段 poll + recv
+  auto start_time = std::chrono::steady_clock::now();
   while (received < msg_len) {
+    int poll_timeout = -1; // -1 表示无限等待
+    if (timeout_ms > 0) {
+      auto now = std::chrono::steady_clock::now();
+      auto elapsed =
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time)
+              .count();
+      int remaining = static_cast<int>(timeout_ms) - static_cast<int>(elapsed);
+      if (remaining <= 0) {
+        error_msg_ = "Receive timeout while reading message body";
+        std::cerr << error_msg_ << std::endl;
+        return false;
+      }
+      // 每次轮询不超过 1000ms，避免长时间阻塞难以响应取消
+      poll_timeout = remaining > 1000 ? 1000 : remaining;
+    }
+
+    struct pollfd pfd_body;
+    pfd_body.fd = socket_fd_;
+    pfd_body.events = POLLIN;
+    int pr = poll(&pfd_body, 1, poll_timeout);
+    if (pr <= 0) {
+      if (pr < 0) {
+        error_msg_ = "Poll error while receiving body: " +
+                     std::string(strerror(errno));
+        std::cerr << error_msg_ << std::endl;
+      } else {
+        error_msg_ = "Receive timeout while waiting for body data";
+        std::cerr << error_msg_ << std::endl;
+      }
+      state_ = ConnectionState::ERROR;
+      return false;
+    }
+
     ssize_t result =
         recv(socket_fd_, &serialized_msg[received], msg_len - received, 0);
     if (result <= 0) {
