@@ -52,6 +52,13 @@ target("rdma_cache_benchmark")
     add_deps("rdmasim")
     add_links("pthread")
 
+-- 性能测试：三种延迟模型对比
+target("rdma_performance_test")
+    set_kind("binary")
+    add_files("test/rdma_performance_test.cpp")
+    add_deps("rdmasim")
+    add_links("pthread")
+
 -- 设置安装规则
 target("rdmasim")
     set_installdir("/usr/local")

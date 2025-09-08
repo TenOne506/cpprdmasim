@@ -485,24 +485,24 @@ bool RdmaDevice::post_send(uint32_t qp_num, const RdmaWorkRequest &wr) {
     auto cq_it = cqs_.find(qp_info.send_cq);
     if (cq_it != cqs_.end()) {
       cq_it->second.completions.push_back(completion);
-      std::cout << "Added completion to device CQ " << qp_info.send_cq
-                << std::endl;
+      // std::cout << "Added completion to device CQ " << qp_info.send_cq
+      //           << std::endl;
     } else {
       CQValue cq_info;
       if (cq_cache_->get(qp_info.send_cq, cq_info)) {
         maybe_sleep_ns(middle_delay_ns_.load(std::memory_order_relaxed));
         cq_info.completions.push_back(completion);
         cq_cache_->set(qp_info.send_cq, cq_info);
-        std::cout << "Added completion to cached CQ " << qp_info.send_cq
-                  << std::endl;
+        // std::cout << "Added completion to cached CQ " << qp_info.send_cq
+        //           << std::endl;
       } else {
         // 尝试主机交换路径
         auto host_it = cqs_host_.find(qp_info.send_cq);
         if (host_it != cqs_host_.end()) {
           maybe_sleep_ns(host_swap_delay_ns_.load(std::memory_order_relaxed));
           host_it->second.completions.push_back(completion);
-          std::cout << "Added completion to host CQ " << qp_info.send_cq
-                    << std::endl;
+          // std::cout << "Added completion to host CQ " << qp_info.send_cq
+          //           << std::endl;
         } else {
           std::cerr << "Failed to find CQ " << qp_info.send_cq
                     << " for completion" << std::endl;
