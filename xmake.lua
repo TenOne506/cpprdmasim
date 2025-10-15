@@ -66,6 +66,13 @@ target("rdma_cache_innovation_test")
     add_deps("rdmasim")
     add_links("pthread")
 
+-- 硬件加速仿真测试
+target("rdma_hardware_accel_sim_test")
+    set_kind("binary")
+    add_files("test/rdma_hardware_accel_sim_test.cpp")
+    add_deps("rdmasim")
+    add_links("pthread")
+
 -- 设置安装规则
 target("rdmasim")
     set_installdir("/usr/local")
